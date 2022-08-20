@@ -3,6 +3,7 @@
 import argparse
 import multiprocessing as mp
 import os
+import re
 import sys
 from enum import Enum
 from functools import partial
@@ -94,7 +95,7 @@ def exploit(session: requests.Session, url: str) -> None:
 
 
 def check_zimbra(session: requests.Session, url: str) -> None:
-    urls = [url] + [url.replace('://', f'://{sub}.') for sub in ZIMBRA_SUBDOMAINS]
+    urls = [url] + [re.sub(r'://(www\.)?', f'://{sub}.', url, re.I) for sub in ZIMBRA_SUBDOMAINS]
     for u in urls:
         try:
             r = session.get(u, timeout=5.0, verify=False)
